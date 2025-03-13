@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -10,8 +10,12 @@ import (
 )
 
 func setupTest() {
-	go main()
-	time.Sleep(100 * time.Millisecond)
+	go StartServer(ServerConfig{
+		ListenPort:     8080,
+		BufferSize:     1024,
+		MaxConnections: 1000,
+		MaxRequestSize: 1024,
+	}, nil)
 }
 
 // test a standard HTTP request

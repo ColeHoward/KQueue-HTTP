@@ -1,21 +1,42 @@
 package main
 
 import (
+	"context"
+	"flag"
+
+	"github.com/ColeHoward/Inferno/internal/api"
 	"github.com/ColeHoward/Inferno/internal/server"
+	"github.com/ColeHoward/Inferno/internal/types"
 )
 
 func main() {
-	port := 8080
-	bufferSize := 1024
-	dataChan := make(chan server.ClientRequest, 100)
-	serverConfig := server.ServerConfig{
-		ListenPort:        port,
-		BufferSize:        bufferSize,
-		MaxConnections:    10_000,
-		ReadTimeoutSec:    10,
-		ConnectionTimeout: 10,
-		MaxRequestSize:    1024,
-	}
+	useKqueue := flag.Bool("kqueue", false, "Run the kqueue-based server instead of the traditional net/http one")
+	flag.Parse()
 
-	server.StartServer(serverConfig, dataChan)
+	if *useKqueue {
+		router := api.NewRouter()
+
+		router.RegisterRoute("/", func(req types.Request) (int, string, error) {
+			return 200, "Welcome to Inferno!", nil
+		})
+
+		router.RegisterRoute("/process", func(req types.Request) (int, string, error) {
+			result := "result"
+			return 200, result, nil
+		})
+
+		serverConfig := server.ServerConfig{
+			ListenPort:     8080,
+			BufferSize:     1024,
+			MaxConnections: 10_000,
+			MaxRequestSize: 1024 * 1024,
+			NumWorkers:     100,
+		}
+
+		server.StartServer(serverConfig, router)
+	} else {
+		ctx, cancel := context.WithCancel(context.Background())
+		server.StartHTTPServer(ctx, 8080)
+		defer cancel()
+	}
 }

@@ -13,65 +13,58 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
+	"github.com/ColeHoward/Inferno/internal/types"
 	"golang.org/x/sys/unix"
 )
 
 var (
 	connBuffers = make(map[int]*bytes.Buffer)
-	mutex       sync.RWMutex  // only lock for write operations
-	bufferPool  = &sync.Pool{ //avoid allocating new buffers each request (less garbage collection)
-		New: func() interface{} {
-			return make([]byte, 8192)
+	mutex       sync.RWMutex 
+	bufferPool  = &sync.Pool{
+		New: func() any {
+			buff := make([]byte, 8192)
+			return buff
 		},
 	}
 )
 
-type ClientRequest struct {
-	fd   int
-	data []byte
-}
 
 type ServerConfig struct {
-	ListenPort        int
-	BufferSize        int
-	MaxConnections    int
-	ReadTimeoutSec    int
-	ConnectionTimeout int
-	MaxRequestSize    int
+	ListenPort     int
+	BufferSize     int
+	MaxConnections int
+	MaxRequestSize int
+	NumWorkers     int
 }
 
-// Tracking active connections
 var (
 	activeConnections int64
-	maxConnections    int64 = 10000
+	maxConnections    int64 = 10_000
+	numWorkers        int   = 100
 )
 
-// creates TCP socket, binds it to specified port, and starts listening
 func createListenerSocket(port int) (int, error) {
-	// Create a TCP socket.
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return -1, fmt.Errorf("socket error: %v", err)
 	}
 
-	// Allow socket reuse to avoid "address already in use" issues
-	// send packets immediately instead of queuing them
+	// allow socket reuse to avoid "address already in use" issues
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		unix.Close(fd)
 		return -1, fmt.Errorf("setsockopt error: %v", err)
 	}
 
-	// bind socket to localhost on specified port
-	sa := &unix.SockaddrInet4{Port: port}
-	copy(sa.Addr[:], net.ParseIP("127.0.0.1").To4())
-	if err := unix.Bind(fd, sa); err != nil {
+	socket_address := &unix.SockaddrInet4{Port: port}
+	copy(socket_address.Addr[:], net.ParseIP("0.0.0.0").To4())
+	if err := unix.Bind(fd, socket_address); err != nil {
 		unix.Close(fd)
 		return -1, fmt.Errorf("bind error: %v", err)
 	}
 
-	// start listening with a backlog of 10 connections
-	if err := unix.Listen(fd, 10); err != nil {
+	if err := unix.Listen(fd, 512); err != nil {
 		unix.Close(fd)
 		return -1, fmt.Errorf("listen error: %v", err)
 	}
@@ -107,23 +100,21 @@ func parseHTTPRequest(data []byte) (*http.Request, int, error) {
 }
 
 // reads data from a client connection, then pushes it through provided channel
-func readClientData(ev unix.Kevent_t, out chan<- ClientRequest, maxRequestSize int) {
+func readClientData(ev unix.Kevent_t, out chan<- types.Request, maxRequestSize int) {
 	fd := int(ev.Ident)
 
-	// Check if the event indicates an error or EOF condition
+	// check if event indicates an error or EOF condition
 	if ev.Flags&unix.EV_EOF != 0 || ev.Flags&unix.EV_ERROR != 0 {
 		closeClientConnection(fd)
 		return
 	}
 
-	// Get buffer from pool instead of allocating new one each time
 	tempBuffer := bufferPool.Get().([]byte)
-	defer bufferPool.Put(&tempBuffer)
+	defer bufferPool.Put(tempBuffer)
 
 	n, err := unix.Read(fd, tempBuffer)
 	if err != nil {
 		if err == unix.EWOULDBLOCK || err == unix.EAGAIN {
-			// no data to read
 			return
 		}
 		fmt.Printf("Read error on fd %d: %v\n", fd, err)
@@ -131,15 +122,12 @@ func readClientData(ev unix.Kevent_t, out chan<- ClientRequest, maxRequestSize i
 		return
 	}
 	if n == 0 {
-		fmt.Printf("Connection closed, fd: %d\n", fd)
 		closeClientConnection(fd)
 		return
 	}
 
 	newData := tempBuffer[:n]
-	fmt.Printf("Data received on fd %d: %s\n", fd, string(newData))
 
-	// append new data to connection's buffer
 	mutex.Lock()
 	buf, exists := connBuffers[fd]
 	if !exists {
@@ -148,7 +136,6 @@ func readClientData(ev unix.Kevent_t, out chan<- ClientRequest, maxRequestSize i
 	}
 	buf.Write(newData)
 
-	// check request size limits
 	if buf.Len() > maxRequestSize {
 		mutex.Unlock()
 		writeHTTPResponse(fd, 413, "Request Entity Too Large")
@@ -166,14 +153,8 @@ func readClientData(ev unix.Kevent_t, out chan<- ClientRequest, maxRequestSize i
 			closeClientConnection(fd)
 			return
 		}
-		if req == nil {
-			// incomplete request, wait for more data before parsing
-			break
-		}
 
-		// ensure entire body has been received before pushing request
-		if req.ContentLength > 0 && int64(buf.Len()-consumed) < req.ContentLength {
-			// wait for remaining body data
+		if req == nil || (req.ContentLength > 0 && int64(buf.Len()-consumed) < req.ContentLength) {
 			break
 		}
 
@@ -182,10 +163,10 @@ func readClientData(ev unix.Kevent_t, out chan<- ClientRequest, maxRequestSize i
 		copy(requestData, buf.Bytes()[:consumed+int(req.ContentLength)])
 
 		select {
-		case out <- ClientRequest{fd: fd, data: requestData}:
-			buf.Next(consumed + int(req.ContentLength)) // remove processed bytes
+		case out <- types.Request{FD: fd, Data: requestData}:
+			buf.Next(consumed + int(req.ContentLength)) // remove only the processed bytes
 		default:
-			// if channel is full, return 503 and close connection
+			// channel is full
 			mutex.Unlock()
 			writeHTTPResponse(fd, 503, "Server is too busy")
 			closeClientConnection(fd)
@@ -196,7 +177,6 @@ func readClientData(ev unix.Kevent_t, out chan<- ClientRequest, maxRequestSize i
 	mutex.Unlock()
 }
 
-// close connection and clean up buffers
 func closeClientConnection(fd int) {
 	unix.Close(fd)
 
@@ -208,7 +188,6 @@ func closeClientConnection(fd int) {
 }
 
 func registerClientConnection(connFd int, kq int) error {
-	// Check if we're at connection limit
 	if atomic.LoadInt64(&activeConnections) >= atomic.LoadInt64(&maxConnections) {
 		unix.Close(connFd)
 		return fmt.Errorf("connection limit reached")
@@ -216,15 +195,16 @@ func registerClientConnection(connFd int, kq int) error {
 
 	atomic.AddInt64(&activeConnections, 1)
 
-	// set new connection to non-blocking mode
 	if err := unix.SetNonblock(connFd, true); err != nil {
 		closeClientConnection(connFd)
 		return nil
 	}
 
-	// Add TCP_NODELAY for lower latency
 	if err := unix.SetsockoptInt(connFd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
-		fmt.Printf("Failed to set TCP_NODELAY on fd %d: %v\n", connFd, err)
+		fmt.Printf("failed to set TCP_NODELAY on fd %d: %v\n", connFd, err)
+	}
+	if err := unix.SetsockoptTimeval(connFd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Sec: 5}); err != nil {
+		fmt.Printf("failed to set SO_RCVTIMeO on fd %d: %v\n", connFd, err)
 	}
 
 	mutex.Lock()
@@ -248,14 +228,14 @@ func registerClientConnection(connFd int, kq int) error {
 }
 
 // main logic for server
-func runKqueueServer(ctx context.Context, listenerFd int, config ServerConfig, inferenceChan chan<- ClientRequest) error {
+func runKqueueServer(ctx context.Context, listenerFd int, config ServerConfig, processChan chan<- types.Request) error {
 	kq, err := unix.Kqueue()
 	if err != nil {
 		return fmt.Errorf("failed to create kqueue: %v", err)
 	}
-	fmt.Println("kqueue created with descriptor:", kq)
+	defer unix.Close(kq)
 
-	// register listener socket to get notifications for read events
+	// register listener event with kqueue
 	listenEvent := unix.Kevent_t{
 		Ident:  uint64(listenerFd),
 		Filter: unix.EVFILT_READ,
@@ -266,86 +246,120 @@ func runKqueueServer(ctx context.Context, listenerFd int, config ServerConfig, i
 		return fmt.Errorf("failed to register listener socket: %v", err)
 	}
 
+	// handle context cancellation
+	go func() {
+		<-ctx.Done()
+		unix.Close(kq)
+		fmt.Println("Context cancelled, shutting down server...")
+		mutex.Lock()
+		for fd := range connBuffers {
+			unix.Close(fd)
+			delete(connBuffers, fd)
+		}
+		mutex.Unlock()
+	}()
+
 	// main event loop
 	for {
-		select {
-		case <-ctx.Done():
-			// Clean shutdown path
-			return nil
-		default:
-			n, err := unix.Kevent(kq, nil, events, nil)
-			if err != nil {
-				if ctx.Err() != nil {
-					// intentional shutdown
-					return nil
-				}
-				// actual error
-				return fmt.Errorf("kevent error: %v", err)
-			}
-			for i := range n {
-				ev := events[i]
-				// check if the event is on the listener socket (i.e. a new connection)
-				if int(ev.Ident) == listenerFd {
-					// handle new connection
-					connFd, _, err := unix.Accept(listenerFd)
-					if err != nil {
-						fmt.Printf("Accept error: %v\n", err)
-						continue
-					}
-
-					registerClientConnection(connFd, kq)
-
-				} else {
-					// for existing connections, read and process incoming data
-					readClientData(ev, inferenceChan, config.MaxRequestSize)
-				}
-			}
+		var timeout = &unix.Timespec{
+			Sec:  1,
+			Nsec: 0,
 		}
-	}
-}
-
-// dummy function to handle complete HTTP requests
-func handleRequestData(input <-chan ClientRequest) {
-	for req := range input {
-		result := "result for: " + string(req.data)
-		err := writeHTTPResponse(req.fd, 200, result)
+		//
+		n, err := unix.Kevent(kq, nil, events, timeout) // wait for events on kqueue
 		if err != nil {
-			fmt.Printf("Write error on fd %d: %v\n", req.fd, err)
+			if err == unix.EINTR {
+                // retry if event read interrupted
+				continue
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("kevent error: %v", err)
+		}
+		for i := range n {
+			ev := events[i]
+			// check if the event is on the listener socket (a new connection)
+			if int(ev.Ident) == listenerFd {
+				connFd, _, err := unix.Accept(listenerFd)
+				if err != nil {
+					fmt.Printf("Accept error: %v\n", err)
+					continue
+				}
+
+				registerClientConnection(connFd, kq)
+
+			} else {
+				// for existing connections, read and process incoming data
+				readClientData(ev, processChan, config.MaxRequestSize)
+			}
 		}
 	}
 }
 
-func StartServer(config ServerConfig, dataChan chan ClientRequest) {
+func processRequest(req types.Request, requestHandler types.Handler) {
+    defer closeClientConnection(req.FD)
+	// Process with handler
+	statusCode, responseBody, err := requestHandler.Handle(req)
+
+	time.Sleep(1 * time.Millisecond)
+	if err != nil {
+		fmt.Printf("Error handling request: %v\n", err)
+		writeHTTPResponse(req.FD, 500, "Internal Server Error")
+	} else {
+		writeHTTPResponse(req.FD, statusCode, responseBody)
+	}
+}
+
+func startWorkerPool(dataChan <-chan types.Request, requestHandler types.Handler) {
+	for i := range numWorkers {
+		go func(workerID int) {
+			for req := range dataChan { 
+				// fmt.Printf("Worker %d handling request from fd %d\n", workerID, req.fd)
+				processRequest(req, requestHandler)
+			}
+		}(i)
+	}
+}
+
+func StartServer(config ServerConfig, requestHandler types.Handler) {
 	atomic.StoreInt64(&maxConnections, int64(config.MaxConnections))
+	dataChan := make(chan types.Request, maxConnections)
+
+	startWorkerPool(dataChan, requestHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	// Setup signal handling for graceful shutdown
+	// setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// monitor for shutdown signals
 	go func() {
 		<-sigChan
-		fmt.Println("Shutdown signal received, closing server...")
+		fmt.Printf("Shutdown signal received, closing server...\n")
 		cancel()
+		// give server a chance to shut down
+		time.Sleep(2 * time.Second)
+
+		// force exit
+		fmt.Println("Forcing shutdown...")
+		os.Exit(0)
 	}()
 
-	// create listener socket on port 8080
+	fmt.Println("setting up listener socket on port\n", config.ListenPort)
 	listenerFd, err := createListenerSocket(config.ListenPort)
 	if err != nil {
 		fmt.Println("Error setting up listener socket:", err)
 		os.Exit(1)
 	}
 	defer unix.Close(listenerFd)
-	fmt.Println("Listening on port 8080 using kqueue-based event loop")
+	fmt.Printf("Listening on port %d using kqueue-based event loop", config.ListenPort)
 
-	// start request handler
-	go handleRequestData(dataChan)
-
-	// run kqueue-based event loop
 	if err := runKqueueServer(ctx, listenerFd, config, dataChan); err != nil {
 		fmt.Println("Error running kqueue server:", err)
 		os.Exit(1)
 	}
+
+	fmt.Println("Server shutdown complete")
 }
