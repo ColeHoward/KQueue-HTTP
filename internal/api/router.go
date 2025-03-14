@@ -3,7 +3,7 @@ package api
 import (
 	"strings"
 
-	"github.com/ColeHoward/Inferno/internal/types"
+	"github.com/ColeHoward/KQueue-HTTP/internal/types"
 )
 
 type Router struct {

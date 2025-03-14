@@ -4,9 +4,9 @@ import (
 	"context"
 	"flag"
 
-	"github.com/ColeHoward/Inferno/internal/api"
-	"github.com/ColeHoward/Inferno/internal/server"
-	"github.com/ColeHoward/Inferno/internal/types"
+	"github.com/ColeHoward/KQueue-HTTP/internal/api"
+	"github.com/ColeHoward/KQueue-HTTP/internal/server"
+	"github.com/ColeHoward/KQueue-HTTP/internal/types"
 )
 
 func main() {
@@ -17,7 +17,7 @@ func main() {
 		router := api.NewRouter()
 
 		router.RegisterRoute("/", func(req types.Request) (int, string, error) {
-			return 200, "Welcome to Inferno!", nil
+			return 200, "Hello World!", nil
 		})
 
 		router.RegisterRoute("/process", func(req types.Request) (int, string, error) {

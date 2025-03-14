@@ -5,3 +5,4 @@ test.go
 venv
 cpu.prof
 mem.prof
+test/

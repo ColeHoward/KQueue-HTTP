@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ColeHoward/Inferno/internal/server"
-	"github.com/ColeHoward/Inferno/internal/types"
+	"github.com/ColeHoward/KQueue-HTTP/internal/server"
+	"github.com/ColeHoward/KQueue-HTTP/internal/types"
 )
 
 func TestServerWithRouter(t *testing.T) {

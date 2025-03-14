@@ -1,4 +1,4 @@
-module github.com/ColeHoward/Inferno
+module github.com/ColeHoward/KQueue-HTTP
 
 go 1.23.2
 

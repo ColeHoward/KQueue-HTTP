@@ -3,7 +3,7 @@ package api
 import (
 	"testing"
 
-	"github.com/ColeHoward/Inferno/internal/types"
+	"github.com/ColeHoward/KQueue-HTTP/internal/types"
 )
 
 func TestRouter(t *testing.T) {
